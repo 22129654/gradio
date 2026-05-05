@@ -2932,12 +2932,7 @@ Received inputs:
                     ports=worker_ports,
                 )
                 self._static_worker_pool.start()
-                # When Node is the front proxy, it handles routing to workers
-                # directly — no need for the 307 redirect middleware.
-                if not self._node_is_proxy and not os.environ.get(
-                    "GRADIO_DISABLE_REDIRECT_MIDDLEWARE"
-                ):
-                    self.server_app.enable_static_workers(self._static_worker_pool)
+
                 if not quiet:
                     print(
                         f"* Static file workers: {resolved_num_workers} processes on ports {self._static_worker_pool.ports}"

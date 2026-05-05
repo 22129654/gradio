@@ -61,7 +61,6 @@ from python_multipart.multipart import parse_options_header
 from starlette.background import BackgroundTask
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.responses import RedirectResponse
-from starlette.types import ASGIApp, Receive, Scope, Send
 
 import gradio
 from gradio import (
@@ -104,7 +103,6 @@ from gradio.route_utils import (  # noqa: F401
     GradioMultiPartParser,
     GradioUploadFile,
     MultiPartException,
-    NodeProxyCache,
     Request,
     compare_passwords_securely,
     create_lifespan_handler,
@@ -242,62 +240,6 @@ client = httpx.AsyncClient(
 file_upload_statuses = FileUploadProgress()
 
 
-class StaticRedirectMiddleware:
-    """
-    Pure ASGI middleware that redirects static file requests to worker processes.
-
-    No-op when ``app.static_worker_pool is None`` — the fast path is a single
-    pointer comparison, so there is zero overhead when workers aren't configured.
-
-    Uses 307 redirects so the client connects directly to the worker —
-    zero bytes proxied through the main server.
-    """
-
-    def __init__(self, asgi_app: ASGIApp, gradio_app: App) -> None:
-        self.asgi_app = asgi_app
-        self.gradio_app = gradio_app
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or self.gradio_app.static_worker_pool is None:
-            await self.asgi_app(scope, receive, send)
-            return
-
-        path: str = scope.get("path", "")
-        check_path = path
-        if check_path.startswith(API_PREFIX):
-            check_path = check_path[len(API_PREFIX) :]
-
-        if not any(check_path.startswith(p) for p in self.gradio_app._static_prefixes):
-            await self.asgi_app(scope, receive, send)
-            return
-
-        # Redirect to a static worker — 307 preserves method and body
-        pool = self.gradio_app.static_worker_pool
-        backend_url = pool.get_next_url()
-        worker_path = check_path
-        query_string = scope.get("query_string", b"")
-        url = f"{backend_url}{worker_path}"
-        if query_string:
-            url += f"?{query_string.decode()}"
-
-        await send(
-            {
-                "type": "http.response.start",
-                "status": 307,
-                "headers": [
-                    (b"location", url.encode()),
-                    (b"content-length", b"0"),
-                ],
-            }
-        )
-        await send(
-            {
-                "type": "http.response.body",
-                "body": b"",
-            }
-        )
-
-
 class App(FastAPI):
     """
     FastAPI App Wrapper
@@ -342,70 +284,6 @@ class App(FastAPI):
         kwargs.setdefault("redoc_url", None)
         self.custom_component_hashes: dict[str, str] = {}
         super().__init__(**kwargs)
-
-    def enable_static_workers(self, worker_pool) -> None:
-        """Activate the static redirect middleware by setting the worker pool reference."""
-        from gradio.route_utils import STATIC_ROUTE_PREFIXES
-
-        self.static_worker_pool = worker_pool
-        self._static_prefixes = STATIC_ROUTE_PREFIXES
-
-    # Create a single client to be reused across requests
-    # We're not overriding any defaults here
-
-    client = httpx.AsyncClient()
-    proxy_cache = NodeProxyCache(client)
-
-    @staticmethod
-    async def proxy_to_node(
-        request: fastapi.Request,
-        app: App,
-        server_name: str,
-        node_port: int,
-        python_port: int,
-        scheme: str = "http",
-        mounted_path: str = "",
-    ) -> Response:
-        full_path = request.url.path
-        if mounted_path:
-            full_path = full_path.replace(mounted_path, "")
-        if request.url.query:
-            full_path += f"?{request.url.query}"
-
-        root_path = route_utils.get_root_url(
-            request=request,
-            route_path=request.url.path,
-            root_path=app.root_path,
-        )
-
-        url = f"{scheme}://{server_name}:{node_port}{full_path}"
-
-        server_url = f"{scheme}://{server_name}"
-        if python_port:
-            server_url += f":{python_port}"
-        if mounted_path:
-            server_url += mounted_path
-
-        headers = dict(request.headers)
-        headers["x-gradio-server"] = server_url
-        headers["x-gradio-port"] = str(python_port)
-        headers["x-gradio-mounted-path"] = mounted_path
-        headers["x-gradio-original-url"] = str(root_path)
-
-        if os.getenv("GRADIO_LOCAL_DEV_MODE"):
-            headers["x-gradio-local-dev-mode"] = "1"
-
-        new_request = App.client.build_request(
-            request.method, httpx.URL(url), headers=headers
-        )
-        node_response = await App.client.send(new_request, stream=True)
-
-        return StreamingResponse(
-            node_response.aiter_raw(),
-            status_code=node_response.status_code,
-            headers=node_response.headers,
-            background=BackgroundTask(node_response.aclose),
-        )
 
     def configure_app(self, blocks: gradio.Blocks) -> None:
         auth = blocks.auth
