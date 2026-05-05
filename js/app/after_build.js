@@ -13,7 +13,7 @@ writeFileSync(
 		{
 			name: "gradio-server-app",
 			type: "module",
-			dependencies: { "http-proxy": "^1.18.1" },
+			dependencies: { "http-proxy": "^1.18.1" }
 		},
 		null,
 		2

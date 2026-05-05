@@ -29,7 +29,7 @@ const PYTHON_ROUTE_PREFIXES = [
 	"/robots.txt",
 	"/pwa_icon",
 	"/manifest.json",
-	"/monitoring",
+	"/monitoring"
 ];
 
 // Routes that can be offloaded to static workers.
@@ -46,7 +46,7 @@ const STATIC_ROUTE_PREFIXES = [
 	"/assets/",
 	"/svelte/",
 	"/favicon.ico",
-	"/custom_component/",
+	"/custom_component/"
 ];
 
 function matchesPrefix(path, prefixes) {
@@ -64,7 +64,7 @@ const proxy = httpProxy.createProxyServer({
 	// Don't modify the path
 	ignorePath: false,
 	// Forward the original host header
-	changeOrigin: false,
+	changeOrigin: false
 });
 
 proxy.on("error", (err, req, res) => {
@@ -90,7 +90,7 @@ const server = http.createServer((req, res) => {
 			workerIndex = (workerIndex + 1) % staticWorkerPorts.length;
 			console.log(`[node-proxy] ${path} -> worker :${workerPort}`);
 			proxy.web(req, res, {
-				target: `http://${pythonHost}:${workerPort}`,
+				target: `http://${pythonHost}:${workerPort}`
 			});
 		} else {
 			proxy.web(req, res, { target: pythonTarget });
@@ -109,7 +109,8 @@ const server = http.createServer((req, res) => {
 	req.headers["x-gradio-server"] = pythonTarget;
 	req.headers["x-gradio-port"] = String(pythonPort);
 	req.headers["x-gradio-mounted-path"] = "/";
-	req.headers["x-gradio-original-url"] = `http://${req.headers.host || `${host}:${port}`}`;
+	req.headers["x-gradio-original-url"] =
+		`http://${req.headers.host || `${host}:${port}`}`;
 	handler(req, res);
 });
 

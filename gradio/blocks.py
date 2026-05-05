@@ -623,9 +623,7 @@ def _find_free_port(host: str, start: int, try_count: int = 100) -> int:
             return port
         except OSError:
             continue
-    raise OSError(
-        f"Cannot find empty port in range: {start}-{start + try_count - 1}."
-    )
+    raise OSError(f"Cannot find empty port in range: {start}-{start + try_count - 1}.")
 
 
 class BlocksConfig:
@@ -2874,7 +2872,9 @@ Received inputs:
 
             # When Node is the front proxy, the user-facing URL is the Node port
             if self._node_is_proxy and self.node_port is not None:
-                url_host = "localhost" if self.server_name == "0.0.0.0" else self.server_name
+                url_host = (
+                    "localhost" if self.server_name == "0.0.0.0" else self.server_name
+                )
                 self.local_url = f"http://{url_host}:{self.node_port}/"
                 self.local_api_url = f"{self.local_url.rstrip('/')}{API_PREFIX}/"
 
@@ -2893,9 +2893,7 @@ Received inputs:
                         f"* Running on local URL:  {self.protocol}://{self.server_name}:{self.server_port}, with SSR ⚡ (dev mode)"
                     )
                 else:
-                    s = (
-                        "* Running on local URL:  {}://{}:{}"
-                    )
+                    s = "* Running on local URL:  {}://{}:{}"
                     print(s.format(self.protocol, self.server_name, self.server_port))
 
             self._queue.set_server_app(self.server_app)
@@ -2925,7 +2923,9 @@ Received inputs:
                     worker_start = self.server_port + 1
                     if self.node_port is not None:
                         worker_start = max(worker_start, self.node_port + 1)
-                    worker_ports = [worker_start + i for i in range(resolved_num_workers)]
+                    worker_ports = [
+                        worker_start + i for i in range(resolved_num_workers)
+                    ]
                 self._static_worker_pool = StaticWorkerPool(
                     num_workers=resolved_num_workers,
                     config=static_config,
@@ -2934,7 +2934,9 @@ Received inputs:
                 self._static_worker_pool.start()
                 # When Node is the front proxy, it handles routing to workers
                 # directly — no need for the 307 redirect middleware.
-                if not self._node_is_proxy and not os.environ.get("GRADIO_DISABLE_REDIRECT_MIDDLEWARE"):
+                if not self._node_is_proxy and not os.environ.get(
+                    "GRADIO_DISABLE_REDIRECT_MIDDLEWARE"
+                ):
                     self.server_app.enable_static_workers(self._static_worker_pool)
                 if not quiet:
                     print(
