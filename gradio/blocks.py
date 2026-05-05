@@ -610,6 +610,24 @@ def convert_component_dict_to_list(
     return predictions
 
 
+def _find_free_port(host: str, start: int, try_count: int = 100) -> int:
+    """Find an available port by scanning from *start*."""
+    import socket
+
+    for port in range(start, start + try_count):
+        try:
+            s = socket.socket()
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host if host != "0.0.0.0" else "127.0.0.1", port))
+            s.close()
+            return port
+        except OSError:
+            continue
+    raise OSError(
+        f"Cannot find empty port in range: {start}-{start + try_count - 1}."
+    )
+
+
 class BlocksConfig:
     def __init__(self, root_block: Blocks):
         self._id: int = 0
@@ -2727,15 +2745,72 @@ Received inputs:
         self.config = self.get_config_file()
 
         self.ssr_mode = self._resolve_ssr_mode(ssr_mode, disable_when_multi_page=False)
+
+        # Resolve num_workers early so we can pre-compute worker ports
+        # and pass them to the Node proxy at startup.
+        resolved_num_workers = num_workers
+        if resolved_num_workers is None:
+            env_val = os.environ.get("GRADIO_NUM_WORKERS")
+            if env_val is not None:
+                resolved_num_workers = int(env_val)
+
+        self._node_is_proxy = False
+        static_worker_ports: list[int] = []
+
         if self.ssr_mode:
             self.node_path = os.environ.get("GRADIO_NODE_PATH", get_node_path())
-            self.node_server_name, self.node_process, self.node_port = (
-                start_node_server(
-                    server_name=node_server_name,
-                    server_port=node_port,
-                    node_path=self.node_path,
+            is_dev_mode = os.getenv("GRADIO_LOCAL_DEV_MODE") is not None
+
+            if is_dev_mode:
+                # Dev mode: vite dev server on 9876, Python is the front.
+                # Keep the old architecture (Python proxies to vite).
+                self.node_server_name, self.node_process, self.node_port = (
+                    start_node_server(
+                        server_name=node_server_name,
+                        server_port=node_port,
+                        node_path=self.node_path,
+                    )
                 )
-            )
+            else:
+                # Production: Node is the front proxy on the user-facing port.
+                # Python moves to an internal port after Node.
+                # Workers get ports after Python.
+                from gradio.http_server import INITIAL_PORT_VALUE, TRY_NUM_PORTS
+
+                user_port = server_port or int(
+                    os.getenv("GRADIO_SERVER_PORT", str(INITIAL_PORT_VALUE))
+                )
+                python_host = server_name or os.getenv(
+                    "GRADIO_SERVER_NAME", "127.0.0.1"
+                )
+
+                # Find a free port for Python starting after the user-facing port.
+                # We need to know Python's port before starting Node so Node
+                # can proxy to it.
+                python_internal_port = _find_free_port(
+                    python_host, start=user_port + 1, try_count=TRY_NUM_PORTS
+                )
+
+                # Pre-compute static worker ports
+                if resolved_num_workers is not None and resolved_num_workers >= 1:
+                    worker_start = python_internal_port + 1
+                    static_worker_ports = [
+                        worker_start + i for i in range(resolved_num_workers)
+                    ]
+
+                self.node_server_name, self.node_process, self.node_port = (
+                    start_node_server(
+                        server_name=node_server_name or python_host,
+                        server_port=node_port or user_port,
+                        node_path=self.node_path,
+                        python_port=python_internal_port,
+                        python_host=python_host,
+                        static_worker_ports=static_worker_ports,
+                    )
+                )
+                # Python server must use the internal port
+                server_port = python_internal_port
+                self._node_is_proxy = True
         else:
             self.node_server_name = self.node_port = self.node_process = None
 
@@ -2797,27 +2872,35 @@ Received inputs:
             if self.mcp_server_obj:
                 self.mcp_server_obj._local_url = self.local_url
 
+            # When Node is the front proxy, the user-facing URL is the Node port
+            if self._node_is_proxy and self.node_port is not None:
+                url_host = "localhost" if self.server_name == "0.0.0.0" else self.server_name
+                self.local_url = f"http://{url_host}:{self.node_port}/"
+                self.local_api_url = f"{self.local_url.rstrip('/')}{API_PREFIX}/"
+
             self.protocol = (
                 "https"
                 if self.local_url.startswith("https") or self.is_colab
                 else "http"
             )
             if not self.is_colab and not quiet:
-                s = (
-                    "* Running on local URL:  {}://{}:{}, with SSR ⚡ (experimental, to disable set `ssr_mode=False` in `launch()`)"
-                    if self.ssr_mode
-                    else "* Running on local URL:  {}://{}:{}"
-                )
-                print(s.format(self.protocol, self.server_name, self.server_port))
+                if self._node_is_proxy and self.node_port is not None:
+                    print(
+                        f"* Running on local URL:  {self.protocol}://{self.server_name}:{self.node_port}, with SSR ⚡ (Node proxy -> Python :{self.server_port})"
+                    )
+                elif self.ssr_mode:
+                    print(
+                        f"* Running on local URL:  {self.protocol}://{self.server_name}:{self.server_port}, with SSR ⚡ (dev mode)"
+                    )
+                else:
+                    s = (
+                        "* Running on local URL:  {}://{}:{}"
+                    )
+                    print(s.format(self.protocol, self.server_name, self.server_port))
 
             self._queue.set_server_app(self.server_app)
 
             # Static worker pool for offloading file serving / uploads
-            resolved_num_workers = num_workers
-            if resolved_num_workers is None:
-                env_val = os.environ.get("GRADIO_NUM_WORKERS")
-                if env_val is not None:
-                    resolved_num_workers = int(env_val)
             if resolved_num_workers is not None and resolved_num_workers >= 1:
                 from gradio.routes import (
                     BUILD_PATH_LIB,
@@ -2834,23 +2917,24 @@ Received inputs:
                     max_file_size=self.max_file_size,
                     favicon_path=str(self.favicon_path) if self.favicon_path else None,
                 )
-                # Start worker ports after the node port (if SSR is active)
-                # to avoid port collisions.
-                worker_start = self.server_port + 1
-                if self.node_port is not None:
-                    worker_start = max(worker_start, self.node_port + 1)
-                worker_ports = [worker_start + i for i in range(resolved_num_workers)]
+                # When Node is the front proxy, worker ports were pre-computed above.
+                # Otherwise, compute them here.
+                if self._node_is_proxy and static_worker_ports:
+                    worker_ports = static_worker_ports
+                else:
+                    worker_start = self.server_port + 1
+                    if self.node_port is not None:
+                        worker_start = max(worker_start, self.node_port + 1)
+                    worker_ports = [worker_start + i for i in range(resolved_num_workers)]
                 self._static_worker_pool = StaticWorkerPool(
                     num_workers=resolved_num_workers,
                     config=static_config,
                     ports=worker_ports,
                 )
                 self._static_worker_pool.start()
-                # Only enable the 307 redirect middleware when there's no
-                # external reverse proxy (nginx) doing the routing.  When
-                # nginx sits in front the middleware must stay disabled so
-                # the browser never sees internal worker addresses.
-                if not os.environ.get("GRADIO_DISABLE_REDIRECT_MIDDLEWARE"):
+                # When Node is the front proxy, it handles routing to workers
+                # directly — no need for the 307 redirect middleware.
+                if not self._node_is_proxy and not os.environ.get("GRADIO_DISABLE_REDIRECT_MIDDLEWARE"):
                     self.server_app.enable_static_workers(self._static_worker_pool)
                 if not quiet:
                     print(

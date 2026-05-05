@@ -536,44 +536,9 @@ class App(FastAPI):
             excluded_handlers=[mcp_subpath],
         )
 
-        if ssr_mode:
-
-            @app.middleware("http")
-            async def conditional_routing_middleware(
-                request: fastapi.Request, call_next
-            ):
-                blocks = app.get_blocks()
-                custom_mount_path = blocks.custom_mount_path
-                path = (
-                    request.url.path.replace(blocks.custom_mount_path or "", "")
-                    if custom_mount_path is not None
-                    else request.url.path
-                )
-
-                if (
-                    getattr(blocks, "node_process", None) is not None
-                    and blocks.node_port is not None
-                    and not any(path.startswith(f"/{url}") for url in INTERNAL_ROUTES)
-                ):
-                    if App.app_port is None:
-                        App.app_port = request.url.port or int(
-                            os.getenv("GRADIO_SERVER_PORT", "7860")
-                        )
-
-                    try:
-                        return await App.proxy_to_node(
-                            request,
-                            app,
-                            blocks.node_server_name or "0.0.0.0",
-                            blocks.node_port,
-                            App.app_port,
-                            request.url.scheme,
-                            custom_mount_path or "",
-                        )
-                    except Exception as e:
-                        print(e)
-                response = await call_next(request)
-                return response
+        # Note: In the current architecture, Node is the front proxy and
+        # routes requests to Python. The old conditional_routing_middleware
+        # that proxied Python -> Node is no longer needed.
 
         @router.get("/user")
         @router.get("/user/")
