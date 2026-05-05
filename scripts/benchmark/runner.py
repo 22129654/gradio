@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import multiprocessing as mp
 import os
 import random
 import subprocess
@@ -166,6 +167,8 @@ async def run_httpx_tier(
     prompts: list[str] | None = None,
     output_dir: Path | None = None,
     sample_count: int = 1,
+    user_id_offset: int = 0,
+    client_concurrency: int | None = None,
 ) -> list[dict]:
     """Run a tier using httpx via /queue/join + /queue/data.
 
@@ -189,7 +192,11 @@ async def run_httpx_tier(
         result = None
         with open(filepath, "rb") as f:
             files = {"files": (filepath, f, "text/plain")}
+            print(f"    [upload] sending POST", flush=True)
             response = await client.post(f"{app_url}/gradio_api/upload", files=files, timeout=60, follow_redirects=True)
+            print(f"    [upload] got response status={response.status_code} in {(time.monotonic()-start)*1000:.0f}ms", flush=True)
+            if response.status_code != 200:
+                print(f"    [upload] FAILED body={response.text[:200]}", flush=True)
             result = response.json()[0]
             return result, time.monotonic() - start
 
@@ -219,6 +226,7 @@ async def run_httpx_tier(
                 else:
                     data.append(item)
         try:
+            print(f"    [user={user_id}] upload done, posting queue/join", flush=True)
             resp = await client.post(
                 f"{app_url}/gradio_api/queue/join",
                 json={
@@ -233,6 +241,7 @@ async def run_httpx_tier(
                     f"POST /queue/join failed: {resp.status_code} {resp.text[:200]}"
                 )
 
+            print(f"    [user={user_id}] queue/join ok, opening SSE stream", flush=True)
             completed = False
             output_data = None
             async with client.stream(
@@ -243,6 +252,7 @@ async def run_httpx_tier(
             ) as stream:
                 deadline = start + request_timeout
                 buffer = b""
+                msg = {}
                 async for chunk in stream.aiter_bytes():
                     buffer += chunk
                     while b"\n\n" in buffer:
@@ -254,8 +264,11 @@ async def run_httpx_tier(
                         if msg.get("msg") == "process_completed":
                             completed = True
                             output_data = msg.get("output", {}).get("data")
+                        elif msg.get("msg") == "close_stream":
                             break
-                    if completed or time.monotonic() > deadline:
+                    if msg and msg.get("msg") == "close_stream":
+                        break
+                    if time.monotonic() > deadline:
                         break
 
             if not completed:
@@ -275,12 +288,14 @@ async def run_httpx_tier(
         except Exception as e:
             duration_ms = (time.monotonic() - start) * 1000
             error_type = type(e).__name__
+            error_msg = f"{error_type}: {e}" if str(e) else error_type
+            print(f"  [request] user={user_id} req={req_id} FAILED after {duration_ms:.0f}ms: {error_msg}", flush=True)
             return {
                 "user_id": user_id,
                 "request_id": req_id,
                 "latency_ms": duration_ms,
                 "success": False,
-                "error": f"{error_type}: {e}" if str(e) else error_type,
+                "error": error_msg,
                 "upload_ms": upload_ms * 1000 if upload_ms is not None else None
             }
 
@@ -289,10 +304,80 @@ async def run_httpx_tier(
     # socket reads). This ensures the benchmark always makes progress.
     round_timeout = request_timeout + 30
 
-    for req_id in range(requests_per_user):
-        async with httpx.AsyncClient() as client:
-            if mode == "burst":
-                # Use an Event + counter instead of asyncio.Barrier (3.11+)
+    if mode == "wave":
+        # Wave mode: launch all requests with a semaphore limiting concurrency
+        # and jitter between launches. No rounds — requests flow continuously.
+        max_concurrent = client_concurrency or min(20, num_users)
+        sem = asyncio.Semaphore(max_concurrent)
+        total_requests = num_users * requests_per_user
+        print(
+            f"    Wave mode: {total_requests} total requests, "
+            f"max {max_concurrent} concurrent",
+            flush=True,
+        )
+
+        async def wave_request(uid: int, rid: int):
+            async with sem:
+                session_hash = f"bench_{uid + user_id_offset}_{rid}_{time.monotonic_ns()}"
+                return await _do_request(client_shared, uid, rid, session_hash)
+
+        async with httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=max_concurrent * 3,
+                max_keepalive_connections=max_concurrent,
+            ),
+        ) as client_shared:
+            # Stagger task creation with jitter so they don't all queue at once
+            tasks = []
+            for rid in range(requests_per_user):
+                for uid in range(num_users):
+                    tasks.append(asyncio.create_task(wave_request(uid, rid)))
+                    jitter = random.uniform(0.01, 0.1)
+                    await asyncio.sleep(jitter)
+
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=round_timeout * requests_per_user,
+                )
+                # Convert exceptions to error dicts
+                final_results = []
+                for i, r in enumerate(results):
+                    if isinstance(r, Exception):
+                        uid = i % num_users
+                        rid = i // num_users
+                        final_results.append({
+                            "user_id": uid,
+                            "request_id": rid,
+                            "latency_ms": 0,
+                            "success": False,
+                            "error": f"{type(r).__name__}: {r}",
+                        })
+                    else:
+                        final_results.append(r)
+                latencies.extend(final_results)
+            except (asyncio.TimeoutError, TimeoutError):
+                print(f"  WARNING: Wave timed out after {round_timeout * requests_per_user:.0f}s")
+                latencies.extend([
+                    {
+                        "user_id": i % num_users,
+                        "request_id": i // num_users,
+                        "latency_ms": round_timeout * 1000,
+                        "success": False,
+                        "error": "Wave timed out",
+                    }
+                    for i in range(total_requests)
+                ])
+
+        if output_dir is not None:
+            save_sample_outputs(latencies, output_dir, 0, sample_count)
+    else:
+        # Burst mode: all N users fire simultaneously per round
+        for req_id in range(requests_per_user):
+            print(f"    Round {req_id+1}/{requests_per_user} starting ({num_users} users)", flush=True)
+            async with httpx.AsyncClient(
+                limits=httpx.Limits(max_connections=num_users * 3, max_keepalive_connections=num_users),
+            ) as client:
                 _arrived = 0
                 _go = asyncio.Event()
 
@@ -300,7 +385,7 @@ async def run_httpx_tier(
                     uid: int, rid: int = req_id,
                 ):
                     nonlocal _arrived
-                    session_hash = f"bench_{uid}_{rid}_{id(_go)}"
+                    session_hash = f"bench_{uid + user_id_offset}_{rid}_{id(_go)}"
                     _arrived += 1
                     if _arrived >= num_users:
                         _go.set()
@@ -328,42 +413,12 @@ async def run_httpx_tier(
                         }
                         for i in range(num_users)
                     ]
-            else:
-                # wave mode: random jitter per user (0–500ms)
-                async def wave_request(uid: int, rid: int = req_id):
-                    jitter = random.uniform(0, 0.5)
-                    await asyncio.sleep(jitter)
-                    session_hash = f"bench_{uid}_{rid}_{time.monotonic_ns()}"
-                    return await _do_request(client, uid, rid, session_hash)
-
-                try:
-                    results = await asyncio.wait_for(
-                        asyncio.gather(*[wave_request(i) for i in range(num_users)]),
-                        timeout=round_timeout,
-                    )
-                except (asyncio.TimeoutError, TimeoutError):
-                    print(
-                        f"  WARNING: Round {req_id} timed out after {round_timeout:.0f}s "
-                        f"(server may be deadlocked)"
-                    )
-                    results = [
-                        {
-                            "user_id": i,
-                            "request_id": req_id,
-                            "latency_ms": round_timeout * 1000,
-                            "upload_ms": None,
-                            "success": False,
-                            "error": f"Round timed out after {round_timeout:.0f}s",
-                        }
-                        for i in range(num_users)
-                    ]
-        latencies.extend(results)
-        if on_round_complete is not None:
-            successful = sum(1 for r in results if r.get("success"))
-            on_round_complete(req_id + 1, requests_per_user, successful, num_users)
-        # Save sample outputs after the round (doesn't affect latency measurements)
-        if output_dir is not None:
-            save_sample_outputs(results, output_dir, req_id, sample_count)
+            latencies.extend(results)
+            if on_round_complete is not None:
+                successful = sum(1 for r in results if r.get("success"))
+                on_round_complete(req_id + 1, requests_per_user, successful, num_users)
+            if output_dir is not None:
+                save_sample_outputs(results, output_dir, req_id, sample_count)
 
     # Strip output_data before returning (it would bloat the JSONL files)
     for lat in latencies:
@@ -497,7 +552,7 @@ async def run_background_traffic(app_url, num_users, stop_event, file_urls, uplo
     tasks = []
 
     async with httpx.AsyncClient(
-        limits=httpx.Limits(max_connections=200, max_keepalive_connections=50), follow_redirects=True
+        limits=httpx.Limits(max_connections=500, max_keepalive_connections=100), follow_redirects=True
     ) as client:
         # Discover static/asset URLs from the HTML page
         asset_urls = await _discover_asset_urls(client, app_url)
@@ -506,7 +561,7 @@ async def run_background_traffic(app_url, num_users, stop_event, file_urls, uplo
 
         # Cap worker counts to avoid exhausting file descriptors
         # Each worker holds ~1 connection, plus prediction users need their own
-        max_bg_workers = 50
+        max_bg_workers = 20
 
         # Page loaders: 2x prediction users (capped)
         for _ in range(min(max(1, num_users * 2), max_bg_workers)):
@@ -528,6 +583,52 @@ async def run_background_traffic(app_url, num_users, stop_event, file_urls, uplo
 
     return bg_results
 
+
+def _bg_process_main(app_url, num_users, stop_event_mp, result_path, file_urls, upload_files):
+    """Process entrypoint: runs background traffic in an isolated event loop.
+
+    Why: keeping bg traffic in the same process as the foreground run_httpx_tier
+    means a single event loop serves ~100 SSE streams plus 150 bg workers, and
+    loop lag contaminates bg latency numbers. Running it in its own process
+    gives each side a dedicated event loop and GIL, so bg p50 measures the
+    server, not harness queueing.
+    """
+    async def _run():
+        stop_event = asyncio.Event()
+
+        async def _watch():
+            while not stop_event_mp.is_set():
+                await asyncio.sleep(0.1)
+            stop_event.set()
+
+        watcher = asyncio.create_task(_watch())
+        try:
+            return await run_background_traffic(
+                app_url, num_users, stop_event, file_urls, upload_files
+            )
+        finally:
+            watcher.cancel()
+
+    bg_results = asyncio.run(_run())
+    with open(result_path, "w") as f:
+        json.dump(bg_results, f)
+
+
+def _tier_worker_main(
+    app_url, num_users, requests_per_user, fn_index, data_template,
+    mode, prompts, result_path, user_id_offset,
+):
+    """Process entrypoint: runs a subset of users in an isolated event loop."""
+    async def _run():
+        return await run_httpx_tier(
+            app_url, num_users, requests_per_user,
+            fn_index=fn_index, data_template=data_template,
+            mode=mode, prompts=prompts,
+            user_id_offset=user_id_offset,
+        )
+    results = asyncio.run(_run())
+    with open(result_path, "w") as f:
+        json.dump(results, f)
 
 
 def compute_background_summary(bg_results):
@@ -561,7 +662,7 @@ pid /tmp/nginx.pid;
 error_log /tmp/nginx_error.log;
 
 events {{
-    worker_connections 1024;
+    worker_connections 4096;
 }}
 
 http {{
@@ -570,6 +671,7 @@ http {{
 
     upstream gradio_main {{
         server 127.0.0.1:{gradio_port};
+        keepalive 32;
     }}
 
     upstream static_workers {{
@@ -583,36 +685,54 @@ http {{
         location /gradio_api/upload {{
             proxy_pass http://static_workers/upload;
             proxy_set_header Host $host;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
             proxy_request_buffering off;
         }}
         location /gradio_api/file= {{
             proxy_pass http://static_workers/file=;
             proxy_set_header Host $host;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
         }}
         location /gradio_api/file/ {{
             proxy_pass http://static_workers/file/;
             proxy_set_header Host $host;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
         }}
         location /static/ {{
             proxy_pass http://static_workers;
             proxy_set_header Host $host;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
         }}
         location /assets/ {{
             proxy_pass http://static_workers;
             proxy_set_header Host $host;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
         }}
         location /svelte/ {{
             proxy_pass http://static_workers;
             proxy_set_header Host $host;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
         }}
         location /favicon.ico {{
             proxy_pass http://static_workers;
             proxy_set_header Host $host;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
         }}
         location /custom_component/ {{
             proxy_pass http://static_workers/custom_component/;
             proxy_set_header Host $host;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
         }}
+
+        {redis_conf}
 
         # Everything else -> main Gradio server
         location / {{
@@ -629,7 +749,7 @@ http {{
 """
 
 
-def _start_nginx(gradio_port: int, worker_ports: list[int], nginx_port: int) -> subprocess.Popen | None:
+def _start_nginx(gradio_port: int, worker_ports: list[int], nginx_port: int, use_redis: bool) -> subprocess.Popen | None:
     """Generate nginx config and start nginx to front the Gradio app + static workers."""
     if not worker_ports:
         return None
@@ -637,10 +757,26 @@ def _start_nginx(gradio_port: int, worker_ports: list[int], nginx_port: int) -> 
     upstream_servers = "\n".join(
         f"        server 127.0.0.1:{p};" for p in worker_ports
     )
+
+    redis_conf = (
+"""
+        {# SSE stream -> static workers (Redis-backed)
+        location /gradio_api/queue/data {{
+            proxy_pass http://static_workers/queue/data;
+            proxy_set_header Host $host;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+            proxy_buffering off;
+            proxy_cache off;
+        }}
+""")
+
     conf = NGINX_CONF_TEMPLATE.format(
         gradio_port=gradio_port,
         nginx_port=nginx_port,
         upstream_servers=upstream_servers,
+        redis_conf=redis_conf if use_redis else ""
     )
     conf_path = Path("/tmp/gradio_nginx.conf")
     conf_path.write_text(conf)
@@ -676,6 +812,9 @@ async def run_benchmark(
     mixed_traffic: bool = False,
     num_workers: int = 1,
     use_nginx: bool = False,
+    redis_url: str | None = None,
+    client_concurrency: int | None = None,
+    ssr_mode: bool = False
 ):
     import socket
 
@@ -703,10 +842,21 @@ async def run_benchmark(
         env["GRADIO_DEFAULT_CONCURRENCY_LIMIT"] = str(concurrency_limit)
     if num_workers > 1:
         env["GRADIO_NUM_WORKERS"] = str(num_workers)
+        env["GRADIO_DISABLE_REDIRECT_MIDDLEWARE"] = "1"
+    resolved_redis = redis_url or os.environ.get("GRADIO_REDIS_URL")
+    if resolved_redis and num_workers > 1:
+        env["GRADIO_REDIS_URL"] = resolved_redis
+    if ssr_mode:
+        env["GRADIO_SSR_MODE"] = "True"
     env["PYTHONUNBUFFERED"] = "1"
 
-    print(f"Synching sample-inputs to {(Path(os.getcwd()) / 'sample-inputs')}")
-    sync_bucket("hf://buckets/gradio/sample-inputs", "sample-inputs")
+    sample_inputs_path = (Path(os.getcwd()) / 'sample-inputs')
+
+    if sample_inputs_path.exists():
+        print("Skipping sample-inputs sync")
+    else:
+        print(f"Synching sample-inputs to {sample_inputs_path}")
+        sync_bucket("hf://buckets/gradio/sample-inputs", "sample-inputs")
     env["GRADIO_ALLOWED_PATHS"] = str((Path(os.getcwd()) / 'sample-inputs').resolve())
 
     print(f"Launching app: {app_path}")
@@ -716,8 +866,13 @@ async def run_benchmark(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-
+    print("APP PROCESS", proc.pid)
+    # time.sleep(2)
     import threading
+    # proc_2 = subprocess.Popen(
+    #     ["py-spy", "record", "-o", "profile_raw.txt", "--pid", f"{proc.pid}", "--format", "raw"],
+    #     env=env,
+    # )
 
     def _stream_app_output(process):
         """Stream app stdout/stderr line by line with a prefix."""
@@ -742,8 +897,22 @@ async def run_benchmark(
         nginx_proc = None
         if use_nginx and num_workers > 1:
             worker_ports = [port + 1 + i for i in range(num_workers)]
+            # Wait for static workers to be ready before starting nginx
+            print("  Waiting for static workers...")
+            for wp in worker_ports:
+                for _ in range(100):
+                    try:
+                        r = httpx.get(f"http://127.0.0.1:{wp}/health", timeout=1)
+                        if r.status_code == 200:
+                            break
+                    except Exception:
+                        time.sleep(0.2)
+                else:
+                    print(f"  WARNING: static worker on port {wp} did not become ready")
+            print(f"  Static workers ready on ports {worker_ports}")
+
             nginx_port = find_available_port(8080)
-            nginx_proc = _start_nginx(port, worker_ports, nginx_port)
+            nginx_proc = _start_nginx(port, worker_ports, nginx_port, bool(redis_url))
             if nginx_proc:
                 app_url = f"http://127.0.0.1:{nginx_port}"
                 print(f"Benchmark will use nginx at {app_url}")
@@ -833,16 +1002,32 @@ async def run_benchmark(
                         flush=True,
                     )
 
-            # Start background traffic if enabled
-            bg_task = None
-            stop_event = None
+            # Start background traffic in a SEPARATE PROCESS if enabled.
+            # Isolating the bg event loop from the foreground SSE-heavy loop
+            # prevents client-side queueing from inflating bg latencies.
+            bg_proc = None
+            bg_stop_mp = None
+            bg_result_path = None
             if mixed_traffic:
-                stop_event = asyncio.Event()
-                bg_task = asyncio.create_task(
-                    run_background_traffic(app_url, tier, stop_event, download_urls, upload_files)
+                bg_stop_mp = mp.Event()
+                bg_result_path = tier_dir / "_bg_results.json"
+                bg_proc = mp.Process(
+                    target=_bg_process_main,
+                    args=(
+                        app_url,
+                        tier,
+                        bg_stop_mp,
+                        str(bg_result_path),
+                        download_urls,
+                        upload_files,
+                    ),
+                    daemon=True,
                 )
+                print("RUNNING BACKGROUND PROCESS SEPARATE PROCESS")
+                bg_proc.start()
 
             # Run the tier
+            print(f"  Starting run_httpx_tier: {tier} users, {requests_per_user} rounds, mode={mode}", flush=True)
             start = time.monotonic()
             client_latencies = await run_httpx_tier(
                 app_url,
@@ -854,6 +1039,7 @@ async def run_benchmark(
                 on_round_complete=on_round_complete,
                 prompts=prompts,
                 output_dir=tier_dir,
+                client_concurrency=client_concurrency,
             )
             if pbar is not None:
                 pbar.close()
@@ -861,9 +1047,20 @@ async def run_benchmark(
 
             # Stop background traffic and collect results
             bg_results = None
-            if bg_task is not None:
-                stop_event.set()
-                bg_results = await bg_task
+            if bg_proc is not None:
+                bg_stop_mp.set()
+                bg_proc.join(timeout=180)
+                if bg_proc.is_alive():
+                    print("  WARNING: bg traffic process did not exit cleanly, terminating")
+                    bg_proc.terminate()
+                    bg_proc.join(timeout=10)
+                if bg_result_path.exists():
+                    with open(bg_result_path) as f:
+                        bg_results = json.load(f)
+                    bg_result_path.unlink()
+                else:
+                    print("  WARNING: bg traffic process produced no results file")
+                    bg_results = {"page_loads": [], "uploads": [], "downloads": []}
 
                 # Save background traffic JSONL files
                 for traffic_type, results in bg_results.items():
@@ -924,6 +1121,20 @@ async def run_benchmark(
                         f"p90={total.get('p90', 0):.1f}ms "
                         f"p99={total.get('p99', 0):.1f}ms"
                     )
+                qw = server_summary["phases"].get("queue_wait", {})
+                if qw.get("p50") is not None:
+                    print(
+                        f"  Server queue_wait p50={qw['p50']:.1f}ms "
+                        f"p90={qw.get('p90', 0):.1f}ms "
+                        f"p99={qw.get('p99', 0):.1f}ms"
+                    )
+            upload = server_summary.get("upload", {})
+            if upload.get("count"):
+                print(
+                    f"  Server upload p50={upload['p50']:.1f}ms "
+                    f"p90={upload.get('p90', 0):.1f}ms "
+                    f"(n={upload['count']})"
+                )
 
         # Save overall summary
         summary = {
@@ -943,6 +1154,14 @@ async def run_benchmark(
         if nginx_proc is not None:
             nginx_proc.terminate()
             nginx_proc.wait(timeout=3)
+            try:
+                src = Path("/tmp/nginx_error.log")
+                if src.exists():
+                    dest = Path(base_dir) / "nginx_error.log"
+                    dest.write_bytes(src.read_bytes())
+                    print(f"  Copied nginx error log -> {dest}")
+            except Exception as e:
+                print(f"  WARNING: failed to copy nginx error log: {e}")
         exit_code = proc.poll()
         if exit_code is not None:
             print(f"\nWARNING: App process already exited with code {exit_code}")
@@ -959,17 +1178,23 @@ def _write_summary_table(base_dir: Path, tier_results: list[dict]):
     lines = []
     lines.append(
         f"{'Tier':>8} | {'Reqs':>8} | {'Client p50':>12} | {'Client p90':>12} | "
-        f"{'Client p99':>12} | {'Success%':>9} | {'Server p50':>12} | {'Server p90':>12}"
+        f"{'Client p99':>12} | {'Success%':>9} | {'Server p50':>12} | {'Server p90':>12} | "
+        f"{'Queue p50':>12} | {'Queue p90':>12} | {'Upload p50':>12}"
     )
-    lines.append("-" * 110)
+    lines.append("-" * 160)
     for r in tier_results:
         cs = r.get("client_summary", {})
-        ss = r.get("server_summary", {}).get("phases", {}).get("total", {})
+        ss = r.get("server_summary", {})
+        total = ss.get("phases", {}).get("total", {})
+        qw = ss.get("phases", {}).get("queue_wait", {})
+        upload = ss.get("upload", {})
         lines.append(
             f"{r['tier']:>8} | {r['total_requests']:>8} | "
             f"{cs.get('p50', 0):>10.1f}ms | {cs.get('p90', 0):>10.1f}ms | "
             f"{cs.get('p99', 0):>10.1f}ms | {cs.get('success_rate', 0):>8.1%} | "
-            f"{ss.get('p50', 0):>10.1f}ms | {ss.get('p90', 0):>10.1f}ms"
+            f"{total.get('p50', 0):>10.1f}ms | {total.get('p90', 0):>10.1f}ms | "
+            f"{qw.get('p50', 0):>10.1f}ms | {qw.get('p90', 0):>10.1f}ms | "
+            f"{upload.get('p50', 0):>10.1f}ms"
         )
     table = "\n".join(lines)
     with open(base_dir / "summary_table.txt", "w") as f:
@@ -1002,6 +1227,12 @@ def main():
         default="burst",
         help="Load pattern: 'burst' fires all requests simultaneously per round, "
         "'wave' staggers arrivals with random jitter (default: burst)",
+    )
+    parser.add_argument(
+        "--client-concurrency",
+        type=int,
+        default=None,
+        help="Max concurrent requests in wave mode (default: min(20, num_users))",
     )
     parser.add_argument(
         "--port",
@@ -1040,6 +1271,15 @@ def main():
         action="store_true",
         help="Put nginx in front to route static traffic to workers (requires nginx installed)",
     )
+    parser.add_argument(
+        "--redis",
+        default=None,
+        help="Redis URL for SSE delivery via static workers (e.g. redis://localhost:6379)",
+    )
+    parser.add_argument(
+        "--ssr-mode",
+        action="store_true",
+    )
 
     args = parser.parse_args()
     tiers = [int(t.strip()) for t in args.tiers.split(",")]
@@ -1060,6 +1300,9 @@ def main():
             mixed_traffic=args.mixed_traffic,
             num_workers=args.num_workers,
             use_nginx=args.nginx,
+            redis_url=args.redis,
+            client_concurrency=args.client_concurrency,
+            ssr_mode=args.ssr_mode
         )
     )
 

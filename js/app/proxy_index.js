@@ -33,8 +33,12 @@ const PYTHON_ROUTE_PREFIXES = [
 ];
 
 // Routes that can be offloaded to static workers.
-// Matches STATIC_ROUTE_PREFIXES from gradio/route_utils.py.
+// Workers serve both /upload and /gradio_api/upload (same handler).
+// Checked BEFORE the /gradio_api Python catch-all.
 const STATIC_ROUTE_PREFIXES = [
+	"/gradio_api/upload",
+	"/gradio_api/file=",
+	"/gradio_api/file/",
 	"/upload",
 	"/file=",
 	"/file/",
@@ -76,25 +80,27 @@ const server = http.createServer((req, res) => {
 	// Strip query string for prefix matching
 	const path = url.split("?")[0];
 
-	// 1. Python routes (API, config, auth, etc.)
-	if (matchesPrefix(path, PYTHON_ROUTE_PREFIXES)) {
-		proxy.web(req, res, { target: pythonTarget });
-		return;
-	}
-
-	// 2. Static routes -> workers (round-robin) or Python fallback
+	// 1. Static routes -> workers (round-robin) or Python fallback.
+	//    Checked FIRST so /gradio_api/upload isn't caught by the
+	//    /gradio_api Python catch-all below.
 	if (matchesPrefix(path, STATIC_ROUTE_PREFIXES)) {
 		if (staticWorkerPorts.length > 0) {
 			const workerPort =
 				staticWorkerPorts[workerIndex % staticWorkerPorts.length];
 			workerIndex = (workerIndex + 1) % staticWorkerPorts.length;
-			console.log(`[node-proxy] proxying to http://${pythonHost}:${workerPort}`)
+			console.log(`[node-proxy] ${path} -> worker :${workerPort}`);
 			proxy.web(req, res, {
 				target: `http://${pythonHost}:${workerPort}`,
 			});
 		} else {
 			proxy.web(req, res, { target: pythonTarget });
 		}
+		return;
+	}
+
+	// 2. Python routes (API, config, auth, etc.)
+	if (matchesPrefix(path, PYTHON_ROUTE_PREFIXES)) {
+		proxy.web(req, res, { target: pythonTarget });
 		return;
 	}
 

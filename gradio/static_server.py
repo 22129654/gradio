@@ -117,6 +117,8 @@ def create_static_app(config: StaticServerConfig) -> fastapi.FastAPI:
             return FileResponse(config.favicon_path)
         return static_resource("img/logo.svg")
 
+    @app.head("/gradio_api/file={path_or_url:path}")
+    @app.get("/gradio_api/file={path_or_url:path}")
     @app.head("/file={path_or_url:path}")
     @app.get("/file={path_or_url:path}")
     async def file(path_or_url: str, request: fastapi.Request):
@@ -181,6 +183,7 @@ def create_static_app(config: StaticServerConfig) -> fastapi.FastAPI:
             filename=abs_path.name,
         )
 
+    @app.post("/gradio_api/upload")
     @app.post("/upload")
     async def upload_file(
         request: fastapi.Request,
