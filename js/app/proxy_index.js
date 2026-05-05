@@ -105,12 +105,21 @@ const server = http.createServer((req, res) => {
 	}
 
 	// 3. Everything else -> SvelteKit handler (SSR + immutable assets)
-	// Inject headers that SvelteKit's page.server.ts expects to find the Python backend
+	// Log headers once so we can see what the infrastructure sends
+	if (!globalThis._headersLogged) {
+		console.log("[node-proxy] SSR request headers:", JSON.stringify(req.headers, null, 2));
+		globalThis._headersLogged = true;
+	}
+	// Inject headers that SvelteKit's page.server.ts expects to find the Python backend.
+	// x-gradio-server is for internal Node->Python fetches (always http).
+	// x-gradio-original-url is the public-facing URL the browser uses,
+	// so it must respect x-forwarded-proto (e.g. https on HF Spaces).
+	const publicScheme = (req.headers["x-forwarded-proto"] || "http").split(",")[0].trim();
+	const publicHost = req.headers["x-forwarded-host"] || req.headers.host || `${host}:${port}`;
 	req.headers["x-gradio-server"] = pythonTarget;
 	req.headers["x-gradio-port"] = String(pythonPort);
 	req.headers["x-gradio-mounted-path"] = "/";
-	req.headers["x-gradio-original-url"] =
-		`http://${req.headers.host || `${host}:${port}`}`;
+	req.headers["x-gradio-original-url"] = `${publicScheme}://${publicHost}`;
 	handler(req, res);
 });
 
