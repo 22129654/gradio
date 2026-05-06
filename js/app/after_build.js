@@ -28,3 +28,7 @@ copyFileSync(
 	resolve(__dirname, "proxy_index.js"),
 	resolve(out_path, "index.js")
 );
+copyFileSync(
+	resolve(__dirname, "proxy_routes.js"),
+	resolve(out_path, "proxy_routes.js")
+);
