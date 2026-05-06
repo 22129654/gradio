@@ -2831,7 +2831,6 @@ Received inputs:
             auth_dependency=auth_dependency,
             app_kwargs=app_kwargs,
             strict_cors=strict_cors,
-            ssr_mode=self.ssr_mode,
             mcp_server=mcp_server,
             debug=debug,
         )

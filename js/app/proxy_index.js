@@ -2,6 +2,7 @@ import http from "node:http";
 import process from "node:process";
 import httpProxy from "http-proxy";
 import { handler } from "./handler.js";
+import { classifyRoute } from "./proxy_routes.js";
 
 const host = process.env.HOST || "0.0.0.0";
 const port = parseInt(process.env.PORT || "7860", 10);
@@ -17,47 +18,6 @@ const staticWorkerPorts = process.env.GRADIO_STATIC_WORKER_PORTS
 	: [];
 
 let workerIndex = 0;
-
-// Routes that must go to the Python server (FastAPI).
-// /gradio_api covers the API router (queue, call, upload, file, info, etc.)
-// The rest are routes mounted directly on the FastAPI app.
-const PYTHON_ROUTE_PREFIXES = [
-	"/gradio_api",
-	"/config",
-	"/login",
-	"/logout",
-	"/theme.css",
-	"/robots.txt",
-	"/pwa_icon",
-	"/manifest.json",
-	"/monitoring"
-];
-
-// Routes that can be offloaded to static workers.
-// Workers serve both /upload and /gradio_api/upload (same handler).
-// Checked BEFORE the /gradio_api Python catch-all.
-const STATIC_ROUTE_PREFIXES = [
-	"/gradio_api/upload",
-	"/gradio_api/file=",
-	"/gradio_api/file/",
-	"/upload",
-	"/file=",
-	"/file/",
-	"/static/",
-	"/assets/",
-	"/svelte/",
-	"/favicon.ico",
-	"/custom_component/"
-];
-
-function matchesPrefix(path, prefixes) {
-	for (const prefix of prefixes) {
-		if (path === prefix || path.startsWith(prefix)) {
-			return true;
-		}
-	}
-	return false;
-}
 
 const pythonTarget = `http://${pythonHost}:${pythonPort}`;
 
@@ -79,33 +39,27 @@ proxy.on("error", (err, req, res) => {
 const server = http.createServer((req, res) => {
 	const url = req.url || "/";
 	const path = url.split("?")[0];
+	const route = classifyRoute(path, {
+		hasWorkers: staticWorkerPorts.length > 0,
+		serverModeEnabled: !!serverModeEnabled
+	});
 
-	// 1. Static routes -> workers (round-robin) or Python fallback.
-	//    Checked FIRST so /gradio_api/upload isn't caught by the
-	//    /gradio_api Python catch-all below.
-	if (matchesPrefix(path, STATIC_ROUTE_PREFIXES)) {
-		if (staticWorkerPorts.length > 0) {
-			const workerPort =
-				staticWorkerPorts[workerIndex % staticWorkerPorts.length];
-			workerIndex = (workerIndex + 1) % staticWorkerPorts.length;
-			console.log(`[node-proxy] ${path} -> worker :${workerPort}`);
-			proxy.web(req, res, {
-				target: `http://${pythonHost}:${workerPort}`
-			});
-		} else {
-			proxy.web(req, res, { target: pythonTarget });
-		}
+	if (route === "worker") {
+		const workerPort =
+			staticWorkerPorts[workerIndex % staticWorkerPorts.length];
+		workerIndex = (workerIndex + 1) % staticWorkerPorts.length;
+		proxy.web(req, res, {
+			target: `http://${pythonHost}:${workerPort}`
+		});
 		return;
 	}
 
-	// 2. Python routes (API, config, auth, etc.)
-	if (matchesPrefix(path, PYTHON_ROUTE_PREFIXES) || serverModeEnabled) {
-		console.log(`[node-proxy] ${path} -> ${pythonTarget}`);
+	if (route === "python") {
 		proxy.web(req, res, { target: pythonTarget });
 		return;
 	}
 
-	// 3. Everything else -> SvelteKit handler (SSR + immutable assets)
+	// SvelteKit handler (SSR + immutable assets)
 	// Inject headers that SvelteKit's page.server.ts expects to find the Python backend.
 	// x-gradio-server is for internal Node->Python fetches (always http).
 	// x-gradio-original-url is the public-facing URL the browser uses,

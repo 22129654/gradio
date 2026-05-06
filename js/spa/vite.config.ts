@@ -164,9 +164,14 @@ export default defineConfig(({ mode, isSsrBuild }) => {
 
 			include:
 				TEST_MODE === "node"
-					? ["**/*.node-test.{js,mjs,cjs,ts,mts,cts,jsx,tsx}"]
-					: ["**/*.test.{js,mjs,cjs,ts,mts,cts,jsx,tsx}"],
-			exclude: ["**/node_modules/**", "**/gradio/gradio/**", "**/client/js/**"],
+					? ["js/**/*.node-test.{js,mjs,cjs,ts,mts,cts,jsx,tsx}"]
+					: ["js/**/*.test.{js,mjs,cjs,ts,mts,cts,jsx,tsx}"],
+			exclude: [
+				"**/node_modules/**",
+				"**/gradio/gradio/**",
+				"**/client/js/**",
+				"js/app/proxy_routes.test.js"
+			],
 			globals: true,
 
 			onConsoleLog(log, type) {

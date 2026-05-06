@@ -107,7 +107,6 @@ from gradio.route_utils import (  # noqa: F401
     FileUploadProgressNotTrackedError,
     GradioMultiPartParser,
     GradioUploadFile,
-    MultiPartException,
     Request,
     compare_passwords_securely,
     create_lifespan_handler,
@@ -355,7 +354,6 @@ class App(FastAPI):
         app_kwargs: dict[str, Any] | None = None,
         auth_dependency: Callable[[fastapi.Request], str | None] | None = None,
         strict_cors: bool = True,
-        ssr_mode: bool = False,
         mcp_server: bool | None = None,
         debug: bool = False,
     ) -> App:
@@ -2561,7 +2559,6 @@ def mount_gradio_app(
         blocks,
         app_kwargs=app_kwargs,
         auth_dependency=auth_dependency,
-        ssr_mode=blocks.ssr_mode,
         mcp_server=mcp_server,
     )
     old_lifespan = app.router.lifespan_context
