@@ -37,8 +37,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class StaticServerConfig:
-    """Configuration for static file server workers."""
-
     build_path: str = ""
     static_path: str = ""
     uploaded_file_dir: str = ""
@@ -107,9 +105,6 @@ def create_static_app(config: StaticServerConfig) -> fastapi.FastAPI:
         return {"status": "ok"}
 
     return app
-
-
-# ── Static Worker Pool ──────────────────────────────────────────────────────
 
 
 def _run_static_worker(port: int, config_dict: dict):

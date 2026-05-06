@@ -32,6 +32,7 @@ def start_node_server(
     python_port: int | None = None,
     python_host: str | None = None,
     static_worker_ports: list[int] | None = None,
+    debug: bool = False,
 ) -> tuple[str | None, subprocess.Popen[bytes] | None, int | None]:
     """Launches the Node SSR server as a front proxy.
 
@@ -72,6 +73,7 @@ def start_node_server(
         python_port=python_port,
         python_host=python_host or "127.0.0.1",
         static_worker_ports=static_worker_ports or [],
+        debug=debug,
     )
 
     return server_name, node_process, node_port
@@ -88,6 +90,7 @@ def start_node_process(
     python_port: int | None = None,
     python_host: str = "127.0.0.1",
     static_worker_ports: list[int] | None = None,
+    debug: bool = False,
 ) -> tuple[subprocess.Popen[bytes] | None, int | None]:
     if GRADIO_LOCAL_DEV_MODE:
         return None, 9876
@@ -134,6 +137,8 @@ def start_node_process(
             node_process = subprocess.Popen(
                 [node_path, "--import", register_file, SSR_APP_PATH],
                 env=env,
+                stdout=subprocess.DEVNULL if not debug else None,
+                stderr=subprocess.DEVNULL if not debug else None,
             )
 
             # When Node is the front proxy, Python isn't up yet so SSR

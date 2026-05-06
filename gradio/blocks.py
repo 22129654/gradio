@@ -2767,6 +2767,7 @@ Received inputs:
                         server_name=node_server_name,
                         server_port=node_port,
                         node_path=self.node_path,
+                        debug=debug,
                     )
                 )
             else:
@@ -2804,6 +2805,7 @@ Received inputs:
                         python_port=python_internal_port,
                         python_host=python_host,
                         static_worker_ports=static_worker_ports,
+                        debug=debug,
                     )
                 )
                 # Only use the proxy architecture if Node actually started
