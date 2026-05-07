@@ -16,6 +16,20 @@
 	let sidebarWidth = $state(220);
 	let isResizing = $state(false);
 
+	// Load custom spaces from localStorage
+	let customSpaces: NodeTemplate[] = $state(
+		typeof localStorage !== "undefined"
+			? JSON.parse(localStorage.getItem("gradio_custom_spaces") ?? "[]")
+			: []
+	);
+
+	// Auto-save custom spaces to localStorage
+	$effect(() => {
+		if (typeof localStorage !== "undefined") {
+			localStorage.setItem("gradio_custom_spaces", JSON.stringify(customSpaces));
+		}
+	});
+
 	function startResize(e: MouseEvent) {
 		e.preventDefault();
 		isResizing = true;
@@ -34,7 +48,6 @@
 		window.addEventListener("mouseup", onUp);
 	}
 	let customSpaceInput = $state("");
-	let customSpaces: NodeTemplate[] = $state([]);
 	let loadingSpace = $state(false);
 	let loadingSpaceName = $state("");
 	let spaceError = $state("");
@@ -172,8 +185,7 @@
 
 	const sections = [
 		{ key: "spaces", label: "Spaces", icon: "hub", items: LIBRARY.spaces },
-		{ key: "inputs", label: "Inputs", icon: "arrow_forward", items: LIBRARY.inputs },
-		{ key: "outputs", label: "Outputs", icon: "arrow_back", items: LIBRARY.outputs }
+		{ key: "components", label: "Components", icon: "layers", items: [...LIBRARY.inputs, ...LIBRARY.outputs] }
 	];
 </script>
 

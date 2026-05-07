@@ -106,20 +106,30 @@ export async function fetchSpaceApi(spaceId: string): Promise<SpaceApiInfo> {
 	}
 
 	// Use the same endpoint the Space UI uses by default:
-	// 1. unnamed[0] — the first Submit button in a gr.Interface / gr.Blocks
-	// 2. named["/predict"] — gr.Interface default name
-	// 3. heuristic: filter utility endpoints, prefer richest outputs
+	// 1. Apply heuristic to named endpoints (filters utility, prefers rich outputs)
+	// 2. Check unnamed[0] as fallback, but validate it's not a utility endpoint
+	// 3. Fallback to /predict if it exists
 	let epName: string;
 	let ep: any;
-	if (unnamed["0"]) {
+
+	// Try heuristic on named endpoints first (catches event handlers)
+	const namedEndpoint = Object.keys(named).length > 0 ? pickBestEndpoint(named) : null;
+	if (namedEndpoint && !UTILITY_PREFIXES.some(p => namedEndpoint.startsWith(p))) {
+		epName = namedEndpoint;
+		ep = named[epName];
+	} else if (unnamed["0"]) {
+		// unnamed[0] is the Submit button, but still apply validation
 		epName = "0";
 		ep = unnamed["0"];
 	} else if (named["/predict"]) {
 		epName = "/predict";
 		ep = named["/predict"];
-	} else {
-		epName = pickBestEndpoint(named);
+	} else if (namedEndpoint) {
+		// Fallback even if it's a utility endpoint (better than nothing)
+		epName = namedEndpoint;
 		ep = named[epName];
+	} else {
+		throw new Error("No suitable endpoint found");
 	}
 
 
@@ -127,13 +137,15 @@ export async function fetchSpaceApi(spaceId: string): Promise<SpaceApiInfo> {
 		.map((p: any, i: number) => {
 			const portType = componentToPortType(p.component ?? "", typeof p.type === "string" ? p.type : "");
 			if (portType === "__skip__") return null;
-			const hasDefault = p.default !== undefined && p.default !== null;
+			// Use parameter_has_default from API, not the default value itself
+			// (dict format returns default=None even for optional params with defaults)
+			const hasDefault = p.parameter_has_default === true;
 			return {
 				id: `in_${i}`,
 				label: p.label || p.parameter_name || `Input ${i}`,
 				type: portType,
 				required: !hasDefault,
-				default_value: hasDefault ? p.default : undefined
+				default_value: hasDefault && p.default !== undefined ? p.default : undefined
 			};
 		})
 		.filter(Boolean);
